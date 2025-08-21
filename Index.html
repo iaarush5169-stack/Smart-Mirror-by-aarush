@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Smart Mirror — Clock • Weather • Voice</title>
+<style>
+  :root {
+    --fg: #e6e6e6;
+    --muted: #9aa0a6;
+    --accent: #00d1b2;
+    --warn: #ff6b6b;
+  }
+  html,body {
+    margin:0; padding:0; height:100%; background:#000; color:var(--fg);
+    font-family: system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial, "Noto Sans", "Apple Color Emoji", "Segoe UI Emoji";
+    cursor: none; /* mirror vibe; comment if you want pointer */
+  }
+  .wrap {
+    display:flex; flex-direction:column; justify-content:space-between; height:100%;
+    padding:4vmin 5vmin;
+  }
+  /* Clock */
+  .clock {
+    font-size: 18vmin; font-weight: 700; letter-spacing: 0.02em; line-height:1;
+  }
+  .date {
+    font-size: 4.5vmin; color: var(--muted); margin-top: 1vmin; letter-spacing: 0.06em;
+  }
+  /* Weather */
+  .weather {
+    margin-top: 6vmin; display:flex; align-items: baseline; gap: 2.5vmin; flex-wrap: wrap;
+  }
+  .temp { font-size: 9vmin; font-weight: 700; }
+  .cond { font-size: 4.5vmin; color: var(--muted); }
+  .loc  { font-size: 3.8vmin; color: var(--muted); }
+  .minmax { font-size: 3.8vmin; color: var(--muted); }
+  /* Voice / STT */
+  .voice {
+    position: fixed; right: 4vmin; bottom: 4vmin; text-align:right;
+  }
+  .btn {
+    font-size: 2.8vmin; padding: 1.2vmin 1.8vmin; border: 1px solid var(--fg);
+    background: transparent; color: var(--fg); border-radius: 10vmin;
+  }
+  .btn.listening { border-color: var(--accent); color: var(--accent); }
+  .status { font-size: 2.5vmin; color: var(--muted); margin-top: 1vmin; max-width: 50vw; }
+  .transcript { font-size: 3.2vmin; margin-top: .8vmin; color: var(--fg); }
+  /* Inputs (shown only if needed) */
+  .controls {
+    position: fixed; left: 4vmin; bottom: 4vmin; display:flex; gap:1vmin; align-items:center;
+  }
+  .controls input, .controls button {
+    font-size: 2.6vmin; padding: 0.8vmin 1.2vmin; border-radius: 1vmin; border:1px solid #333; background:#111; color:var(--fg);
+  }
+  .hint { color: var(--muted); font-size: 2.3vmin; margin-top: .6vmin; }
+  .badge { display:inline-block; border:1px solid #333; padding:.2em .6em; border-radius:999px; font-size:2.2vmin; color:var(--muted); }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <!-- Top-left: Date + Clock -->
+    <div>
+      <div class="clock" id="clock">00:00</div>
+      <div class="date" id="date">—</div>
+
+      <!-- Weather block -->
+      <div class="weather" id="weather" aria-live="polite">
+        <div class="temp" id="temp">--°</div>
+        <div class="cond" id="cond">Fetching weather…</div>
+        <div class="minmax" id="minmax"></div>
+        <div class="loc" id="loc"></div>
+      </div>
+      <div class="hint" id="geoHint"></div>
+      <div class="badge">Say: “hey smart mirror …” (e.g., “what’s the weather”)</div>
+    </div>
+
+    <!-- (Keep bottom area clean for mirror look) -->
+
+    <!-- Voice controls -->
+    <div class="voice">
+      <button class="btn" id="talkBtn" type="button">🎤 Start Listening</button>
+      <div class="status" id="status">STT ready (Web Speech API)</div>
+      <div class="transcript" id="transcript"></div>
+    </div>
+
+    <!-- Manual city input appears if geolocation denied -->
+    <div class="controls" id="controls" style="display:none">
+      <input id="city" placeholder="Enter city (e.g., Mumbai)" />
+      <button id="setCity">Set City</button>
+    </div>
+  </div>
+
+<script>
+/* =========================
+   CLOCK + DATE
+========================= */
+const clockEl = document.getElementById('clock');
+const dateEl  = document.getElementById('date');
+function pad(n){ return String(n).padStart(2,'0'); }
+function tickClock(){
+  const now = new Date();
+  const hh = pad(now.getHours());
+  const mm = pad(now.getMinutes());
+  clockEl.textContent = `${hh}:${mm}`;
+  dateEl.textContent = now.toLocaleDateString(undefined, {
+    weekday:'long', month:'long', day:'numeric', year:'numeric'
+  });
+}
+tickClock();
+setInterval(tickClock, 1000 * 15); // update every 15s
+
+/* =========================
+   WEATHER (Open‑Meteo)
+   - Tries geolocation
+   - Fallback: manual city + Nominatim (no key)
+========================= */
+const tempEl  = document.getElementById('temp');
+const condEl  = document.getElementById('cond');
+const minmaxEl= document.getElementById('minmax');
+const locEl   = document.getElementById('loc');
+const geoHint = document.getElementById('geoHint');
+const controls= document.getElementById('controls');
+
+async function fetchWeatherByCoords(lat, lon) {
+  // Current + daily temp min/max + weathercode
+  const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}` +
+              `&current=temperature_2m,weather_code&daily=temperature_2m_max,temperature_2m_min,weather_code&timezone=auto`;
+  const resp = await fetch(url);
+  if(!resp.ok) throw new Error('Weather API error');
+  const data = await resp.json();
+  const c = data.current || {};
+  const d = data.daily || {};
+  const nowTemp = Math.round(c.temperature_2m);
+  const code = c.weather_code ?? 0;
+  const max = d.temperature_2m_max?.[0];
+  const min = d.temperature_2m_min?.[0];
+
+  tempEl.textContent = `${isFinite(nowTemp) ? nowTemp : '--'}°`;
+  condEl.textContent = weatherCodeToText(code);
+  minmaxEl.textContent = (isFinite(min) && isFinite(max)) ? `H: ${Math.round(max)}°  L: ${Math.round(min)}°` : '';
+}
+
+function weatherCodeToText(code){
+  // Simplified WMO mapping
+  const map = {
+    0:'Clear', 1:'Mainly clear', 2:'Partly cloudy', 3:'Overcast',
+    45:'Fog', 48:'Depositing rime fog',
+    51:'Light drizzle', 53:'Drizzle', 55:'Heavy drizzle',
+    61:'Light rain', 63:'Rain', 65:'Heavy rain',
+    66:'Freezing rain', 67:'Heavy freezing rain',
+    71:'Light snow', 73:'Snow', 75:'Heavy snow',
+    77:'Snow grains', 80:'Rain showers', 81:'Showers', 82:'Violent showers',
+    85:'Snow showers', 86:'Heavy snow showers',
+    95:'Thunderstorm', 96:'Thunderstorm w/ hail', 99:'Severe thunder w/ hail'
+  };
+  return map[code] || '—';
+}
+
+function tryGeo(){
+  if(!('geolocation' in navigator)){
+    geoHint.textContent = 'Geolocation unavailable. Enter city below.';
+    controls.style.display = 'flex';
+    return;
+  }
+  navigator.geolocation.getCurrentPosition(async pos => {
+    const {latitude:lat, longitude:lon} = pos.coords;
+    await fetchWeatherByCoords(lat, lon).catch(()=>{});
+    // Reverse geocode for city name
+    try{
+      const r = await fetch(`https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lon}&format=json&zoom=10`);
+      const j = await r.json();
+      const place = j.address?.city || j.address?.town || j.address?.village || j.address?.county || '';
+      const state = j.address?.state || '';
+      locEl.textContent = [place, state].filter(Boolean).join(', ');
+      geoHint.textContent = '';
+    }catch(e){ locEl.textContent=''; }
+  }, err => {
+    geoHint.textContent = 'Location permission denied. Enter city below.';
+    controls.style.display = 'flex';
+  }, {enableHighAccuracy:false, timeout:8000, maximumAge:10*60*1000});
+}
+tryGeo();
+
+document.getElementById('setCity').addEventListener('click', async ()=>{
+  const q = document.getElementById('city').value.trim();
+  if(!q) return;
+  // Forward geocode
+  try{
+    const r = await fetch(`https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(q)}&format=json&limit=1`);
+    const j = await r.json();
+    if(!j.length){ condEl.textContent = 'City not found'; return; }
+    const lat = j[0].lat, lon = j[0].lon;
+    locEl.textContent = j[0].display_name.split(',').slice(0,2).join(', ');
+    await fetchWeatherByCoords(lat, lon);
+    geoHint.textContent = '';
+  }catch(e){
+    condEl.textContent = 'Weather fetch failed';
+  }
+});
+
+/* =========================
+   VOICE: STT + "recorded" responses (fallback TTS)
+   - Wake phrase: "hey smart mirror"
+   - Intents: hello/greet, time, date, weather, stop
+========================= */
+const statusEl = document.getElementById('status');
+const transcriptEl = document.getElementById('transcript');
+const talkBtn = document.getElementById('talkBtn');
+
+const hasSTT = ('webkitSpeechRecognition' in window) || ('SpeechRecognition' in window);
+const hasTTS = ('speechSynthesis' in window);
+
+let recognizing = false;
+let wakeHeard = false;
+
+const audioBank = {
+  hello: new Audio('hello.mp3'),
+  time:  new Audio('time.mp3'),
+  date:  new Audio('date.mp3'),
+  weather: new Audio('weather.mp3'),
+  stop:  new Audio('stop.mp3'),
+};
+function playRecordedOrSpeak(key, fallbackText){
+  const a = audioBank[key];
+  if (a && a.src && !a.error) {
+    a.currentTime = 0;
+    a.play().catch(()=>{ if(hasTTS) speak(fallbackText); });
+  } else if (hasTTS) {
+    speak(fallbackText);
+  }
+}
+function speak(text){
+  if(!hasTTS) return;
+  const u = new SpeechSynthesisUtterance(text);
+  u.rate = 1; u.pitch = 1; u.lang = navigator.language || 'en-US';
+  speechSynthesis.cancel(); // stop previous
+  speechSynthesis.speak(u);
+}
+
+if(!hasSTT){
+  statusEl.textContent = 'Speech recognition not supported in this browser.';
+  talkBtn.disabled = true;
+} else {
+  const SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition;
+  const rec = new SpeechRec();
+  rec.continuous = true;
+  rec.interimResults = true;
+  rec.lang = (navigator.language || 'en-US');
+
+  rec.onstart = ()=> {
+    recognizing = true;
+    talkBtn.classList.add('listening');
+    talkBtn.textContent = '🛑 Stop Listening';
+    statusEl.textContent = 'Listening… say “hey smart mirror”';
+  };
+  rec.onend = ()=> {
+    recognizing = false;
+    talkBtn.classList.remove('listening');
+    talkBtn.textContent = '🎤 Start Listening';
+    statusEl.textContent = 'Stopped.';
+    wakeHeard = false;
+  };
+  rec.onerror = (e)=> {
+    statusEl.textContent = 'STT error: ' + e.error;
+  };
+  rec.onresult = (ev)=> {
+    let finalText = '';
+    for(let i=ev.resultIndex; i<ev.results.length; i++){
+      const t = ev.results[i][0].transcript;
+      if(ev.results[i].isFinal) finalText += t + ' ';
+    }
+    if(finalText){
+      const norm = finalText.toLowerCase().trim();
+      transcriptEl.textContent = 'You said: ' + norm;
+      // Wake phrase
+      if (!wakeHeard && /(^|\b)hey\s+smart\s+mirror\b/.test(norm)) {
+        wakeHeard = true;
+        playRecordedOrSpeak('hello', 'Hi! I am listening.');
+        return;
+      }
+      if (!wakeHeard) return; // ignore until wake phrase
+
+      // Intents
+      if(/\b(stop|thank you|never mind|silence)\b/.test(norm)){
+        playRecordedOrSpeak('stop','Okay, stopping.');
+        rec.stop(); return;
+      }
+      if(/\b(time|what.*time|current time)\b/.test(norm)){
+        const now = new Date();
+        const text = `It is ${now.toLocaleTimeString([], {hour:'numeric', minute:'2-digit'})}.`;
+        playRecordedOrSpeak('time', text);
+        return;
+      }
+      if(/\b(date|what.*date|today.?s date)\b/.test(norm)){
+        const now = new Date();
+        const text = `Today is ${now.toLocaleDateString([], {weekday:'long', month:'long', day:'numeric'})}.`;
+        playRecordedOrSpeak('date', text);
+        return;
+      }
+      if(/\b(weather|temperature|forecast)\b/.test(norm)){
+        const t = tempEl.textContent.replace('°','');
+        const c = condEl.textContent;
+        const l = locEl.textContent || 'your area';
+        const text = (t && c) ? `Current weather in ${l}: ${t} degrees and ${c}.` : `Fetching the latest weather.`;
+        playRecordedOrSpeak('weather', text);
+        return;
+      }
+      if(/\b(hi|hello|hey there|namaste)\b/.test(norm)){
+        playRecordedOrSpeak('hello','Hello! How can I help?');
+        return;
+      }
+    }
+  };
+
+  talkBtn.addEventListener('click', ()=>{
+    if(recognizing){ rec.stop(); }
+    else {
+      try { rec.start(); }
+      catch { /* ignore rapid restarts */ }
+    }
+  });
+}
+
+/* Optional: auto-hide mouse after a few seconds (mirror aesthetic) */
+let mouseTimer;
+document.addEventListener('mousemove', ()=>{
+  document.body.style.cursor = 'default';
+  clearTimeout(mouseTimer);
+  mouseTimer = setTimeout(()=>{ document.body.style.cursor = 'none'; }, 1500);
+});
+
+</script>
+</body>
+</html>
